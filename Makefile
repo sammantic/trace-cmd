@@ -20,9 +20,11 @@ check: tracegen
 	grep -q 'task: *barebox started' check.txt
 	grep -q 'task: *booting kernel' check.txt
 	test "$$(grep -c 'task:' check.txt)" -eq 8
+	./tracegen -f perfetto -o check.pftrace
+	python3 tests/check_pfetto.py check.pftrace
 	@echo "check: OK"
 
 clean:
-	rm -f *.o tests/*.o tracegen tests/test_trace trace.dat check.dat check.txt tests/*.dat
+	rm -f *.o tests/*.o tracegen tests/test_trace trace.dat check.dat check.txt check.pftrace tests/*.dat tests/*.pftrace
 
 .PHONY: all test check clean

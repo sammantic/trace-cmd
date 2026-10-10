@@ -3,3 +3,4 @@ tracegen
 tests/test_trace
 *.dat
 check.txt
+*.pftrace

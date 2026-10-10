@@ -1,17 +1,23 @@
 /*
  * trace.c - record boot-stage messages and write them as a trace.dat file
  *
- * This file has two halves:
+ * This file has three parts:
  *
  *   1. A recorder.  trace_add("kernel loaded") takes a timestamp and appends
  *      the message to an in-memory linked list.  Nothing is written to disk
  *      yet, so recording is cheap and can happen while the "boot" is running.
  *
- *   2. A writer.  trace_write("trace.dat") walks that list once and produces
- *      a file in the trace-cmd "version 6" format.  That is the format the
- *      Linux tool `trace-cmd record` produces and `trace-cmd report` and
- *      KernelShark read.  We generate it by hand, without libtraceevent, so
- *      the code below documents the format as it goes.
+ *   2. A trace-cmd writer.  trace_write("trace.dat") walks that list once
+ *      and produces a file in the trace-cmd "version 6" format.  That is the
+ *      format the Linux tool `trace-cmd record` produces and
+ *      `trace-cmd report` and KernelShark read.  We generate it by hand,
+ *      without libtraceevent, so the code below documents the format as it
+ *      goes.
+ *
+ *   3. A Perfetto writer.  trace_write_perfetto("trace.pftrace") walks the
+ *      same list and produces a Perfetto trace (protobuf TrackEvents), the
+ *      format ui.perfetto.dev and trace_processor read.  It is also encoded
+ *      by hand; see the comment above part 3 for the packet layout.
  *
  * Big picture of a trace.dat v6 file
  * ----------------------------------
@@ -469,6 +475,335 @@ fail:
 	saved = errno;
 	fclose(f);
 	free(p.buf);
+	errno = saved;
+	return -1;
+}
+
+/* ================================================================== */
+/* Part 3: the Perfetto (protobuf) writer                             */
+/* ================================================================== */
+
+/*
+ * A Perfetto trace is a protobuf "Trace" message streamed to a file: for
+ * every TracePacket the file contains the key byte 0x0a (field 1, "packet",
+ * length-delimited), the packet length as a varint, and the packet bytes.
+ * There is no file header or magic; the 0x0a framing *is* the format.
+ *
+ * We hand-encode three kinds of TracePacket (field numbers from the proto
+ * definitions in perfetto's protos/ tree, all "optional" fields):
+ *
+ *   1. A ClockSnapshot, so the reader can map our CLOCK_MONOTONIC stamps to
+ *      wall time.  It also declares the trace clock to be CLOCK_MONOTONIC
+ *      (BuiltinClock 3); without that Perfetto would assume CLOCK_BOOTTIME,
+ *      which includes suspend time and can drift from what we recorded.
+ *
+ *   2. Two TrackDescriptors naming our tracks:
+ *        uuid 1 "barebox tasks"   - one instant (point) event per message
+ *        uuid 2 "barebox stages"  - one slice per message
+ *
+ *   3. TrackEvents.  Perfetto has no "complete slice with duration" event,
+ *      only BEGIN/END pairs, so message N opens a slice that is closed when
+ *      message N+1 arrives (END before BEGIN, so the stages form a sequence
+ *      rather than nesting).  The final slice is closed at its own timestamp
+ *      and gets duration 0, because the recorder never sees the boot finish.
+ *
+ * Every event packet carries its own name and category (no interning) and
+ * timestamp_clock_id = MONOTONIC, so each packet is self-contained.
+ */
+
+/* protobuf wire types */
+#define PB_VARINT	0u
+#define PB_LEN		2u
+
+/* TracePacket fields */
+#define PB_TRUSTED_SEQ_ID	10u	/* uint32, written by the "service" */
+#define PB_CLOCK_SNAPSHOT	6u	/* ClockSnapshot */
+#define PB_TIMESTAMP		8u	/* uint64, ns */
+#define PB_TRACK_EVENT		11u	/* TrackEvent */
+#define PB_SEQUENCE_FLAGS	13u	/* bit flags, see SEQ_* below */
+#define PB_TS_CLOCK_ID		58u	/* uint32, BuiltinClock */
+#define PB_TRACK_DESCRIPTOR	60u	/* TrackDescriptor */
+
+/* TrackEvent fields */
+#define TE_TYPE		9u	/* Type enum, see TE_* below */
+#define TE_TRACK_UUID	11u	/* uint64 */
+#define TE_CATEGORIES	22u	/* repeated string */
+#define TE_NAME		23u	/* string */
+
+/* TrackDescriptor fields */
+#define TD_UUID		1u
+#define TD_NAME		2u
+
+/* ClockSnapshot / Clock fields */
+#define CS_CLOCKS	1u	/* repeated Clock */
+#define CS_PRIMARY	2u	/* BuiltinClock the trace time runs on */
+#define CLK_CLOCK_ID	1u
+#define CLK_TIMESTAMP	2u
+
+/* BuiltinClock ids (protos/perfetto/common/builtin_clock.proto) */
+#define CLK_REALTIME	1u
+#define CLK_MONOTONIC	3u
+#define CLK_BOOTTIME	6u
+
+/* TrackEvent.Type */
+#define TE_SLICE_BEGIN	1u
+#define TE_SLICE_END	2u
+#define TE_INSTANT	3u
+
+/* TracePacket.SequenceFlags */
+#define SEQ_INCREMENTAL_STATE_CLEARED	1u
+
+/*
+ * All packets belong to one writer sequence.  trace_processor needs the
+ * id to associate TrackEvents with their incremental state (we keep none,
+ * but the association itself is mandatory).
+ */
+#define SEQ_ID		1u
+
+/* Our two track uuids; 0 is reserved for the implicit trace-global track. */
+#define TRACK_TASKS	1u
+#define TRACK_STAGES	2u
+
+#define CATEGORY	"barebox"
+
+/*
+ * A growable byte buffer used to build one (sub-)message before its length
+ * is known.  Allocation failures are sticky in `oom` and surface when the
+ * buffer is written out, which keeps the encode helpers return-value-free.
+ */
+struct pb {
+	uint8_t *buf;
+	size_t len;
+	size_t cap;
+	int oom;
+};
+
+static void pb_raw(struct pb *b, const void *p, size_t n)
+{
+	if (b->oom || n == 0)
+		return;
+	if (b->len + n > b->cap) {
+		size_t cap = b->cap ? b->cap * 2 : 128;
+		uint8_t *nb;
+
+		while (cap < b->len + n)
+			cap *= 2;
+		nb = realloc(b->buf, cap);
+		if (!nb) {
+			b->oom = 1;
+			return;
+		}
+		b->buf = nb;
+		b->cap = cap;
+	}
+	memcpy(b->buf + b->len, p, n);
+	b->len += n;
+}
+
+static void pb_varint(struct pb *b, uint64_t v)
+{
+	while (v > 0x7f) {
+		uint8_t byte = (uint8_t)v | 0x80;
+
+		pb_raw(b, &byte, 1);
+		v >>= 7;
+	}
+	pb_raw(b, &(uint8_t){ (uint8_t)v }, 1);
+}
+
+/* Every protobuf field starts with a key: (field number << 3) | wire type. */
+static void pb_key(struct pb *b, unsigned field, unsigned wire)
+{
+	pb_varint(b, ((uint64_t)field << 3) | wire);
+}
+
+static void pb_uint(struct pb *b, unsigned field, uint64_t v)
+{
+	pb_key(b, field, PB_VARINT);
+	pb_varint(b, v);
+}
+
+/* Append a nested message: key, its length, then its bytes. */
+static void pb_msg(struct pb *b, unsigned field, const struct pb *sub)
+{
+	pb_key(b, field, PB_LEN);
+	pb_varint(b, sub->len);
+	pb_raw(b, sub->buf, sub->len);
+}
+
+static void pb_str(struct pb *b, unsigned field, const char *s)
+{
+	size_t n = strlen(s);
+
+	pb_key(b, field, PB_LEN);
+	pb_varint(b, n);
+	pb_raw(b, s, n);
+}
+
+/* Frame one finished TracePacket and write it to the file. */
+static int perf_put_packet(FILE *f, const struct pb *pkt)
+{
+	struct pb frame = { NULL, 0, 0, 0 };
+	int err;
+
+	pb_key(&frame, 1, PB_LEN);	/* Trace.packet */
+	pb_varint(&frame, pkt->len);
+	pb_raw(&frame, pkt->buf, pkt->len);
+	err = frame.len ? wr(f, frame.buf, frame.len) : 0;
+	free(frame.buf);
+	if (frame.oom || pkt->oom) {
+		errno = ENOMEM;
+		return -1;
+	}
+	return err;
+}
+
+/* Read one clock into nanoseconds. */
+static int clock_ns(clockid_t id, uint64_t *out)
+{
+	struct timespec ts;
+
+	if (clock_gettime(id, &ts) < 0)
+		return -1;
+	*out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+	return 0;
+}
+
+/*
+ * Packet 1 of the trace: the clock snapshot.  Reading CLOCK_MONOTONIC,
+ * CLOCK_BOOTTIME and CLOCK_REALTIME almost together gives the reader a
+ * mapping between "ns since boot" (what we record), the boot clock
+ * (Perfetto's default assumption for proto traces) and wall time (what it
+ * displays), and primary_trace_clock tells it our stamps are MONOTONIC.
+ */
+static int perf_clock_packet(FILE *f)
+{
+	struct pb mono = { NULL, 0, 0, 0 }, boot = { NULL, 0, 0, 0 };
+	struct pb real = { NULL, 0, 0, 0 }, snap = { NULL, 0, 0, 0 };
+	struct pb pkt = { NULL, 0, 0, 0 };
+	uint64_t m, b, r;
+	int err;
+
+	if (clock_ns(CLOCK_MONOTONIC, &m) < 0 ||
+	    clock_ns(CLOCK_BOOTTIME, &b) < 0 ||
+	    clock_ns(CLOCK_REALTIME, &r) < 0)
+		return -1;
+
+	pb_uint(&mono, CLK_CLOCK_ID, CLK_MONOTONIC);
+	pb_uint(&mono, CLK_TIMESTAMP, m);
+	pb_uint(&boot, CLK_CLOCK_ID, CLK_BOOTTIME);
+	pb_uint(&boot, CLK_TIMESTAMP, b);
+	pb_uint(&real, CLK_CLOCK_ID, CLK_REALTIME);
+	pb_uint(&real, CLK_TIMESTAMP, r);
+	pb_msg(&snap, CS_CLOCKS, &mono);
+	pb_msg(&snap, CS_CLOCKS, &boot);
+	pb_msg(&snap, CS_CLOCKS, &real);
+	pb_uint(&snap, CS_PRIMARY, CLK_MONOTONIC);
+
+	pb_uint(&pkt, PB_TRUSTED_SEQ_ID, SEQ_ID);
+	pb_uint(&pkt, PB_SEQUENCE_FLAGS, SEQ_INCREMENTAL_STATE_CLEARED);
+	pb_msg(&pkt, PB_CLOCK_SNAPSHOT, &snap);
+
+	err = perf_put_packet(f, &pkt);
+	free(mono.buf);
+	free(boot.buf);
+	free(real.buf);
+	free(snap.buf);
+	free(pkt.buf);
+	return err;
+}
+
+/* One packet describing a track by uuid + name. */
+static int perf_track_packet(FILE *f, uint64_t uuid, const char *name)
+{
+	struct pb td = { NULL, 0, 0, 0 }, pkt = { NULL, 0, 0, 0 };
+	int err;
+
+	pb_uint(&td, TD_UUID, uuid);
+	pb_str(&td, TD_NAME, name);
+	pb_uint(&pkt, PB_TRUSTED_SEQ_ID, SEQ_ID);
+	pb_msg(&pkt, PB_TRACK_DESCRIPTOR, &td);
+	err = perf_put_packet(f, &pkt);
+	free(td.buf);
+	free(pkt.buf);
+	return err;
+}
+
+/*
+ * One TrackEvent packet.  `name` is NULL for slice ends, which just close
+ * the innermost open slice on the track and repeat nothing else.
+ */
+static int perf_event_packet(FILE *f, uint64_t ts_ns, unsigned type,
+			     uint64_t track, const char *name)
+{
+	struct pb ev = { NULL, 0, 0, 0 }, pkt = { NULL, 0, 0, 0 };
+	int err;
+
+	pb_uint(&ev, TE_TYPE, type);
+	pb_uint(&ev, TE_TRACK_UUID, track);
+	if (name) {
+		pb_str(&ev, TE_CATEGORIES, CATEGORY);
+		pb_str(&ev, TE_NAME, name);
+	}
+	pb_uint(&pkt, PB_TRUSTED_SEQ_ID, SEQ_ID);
+	pb_uint(&pkt, PB_TIMESTAMP, ts_ns);
+	pb_uint(&pkt, PB_TS_CLOCK_ID, CLK_MONOTONIC);
+	pb_msg(&pkt, PB_TRACK_EVENT, &ev);
+	err = perf_put_packet(f, &pkt);
+	free(ev.buf);
+	free(pkt.buf);
+	return err;
+}
+
+/*
+ * Write all entries to `path` as a Perfetto trace, openable with
+ * ui.perfetto.dev ("Open with trace file") or queryable with
+ * trace_processor ("select * from slice" / "instant").  An empty list
+ * produces a valid trace with no events.
+ */
+int trace_write_perfetto(const char *path)
+{
+	const struct entry *e;
+	FILE *f;
+	int saved;
+
+	if (!path) {
+		errno = EINVAL;
+		return -1;
+	}
+	f = fopen(path, "wb");
+	if (!f)
+		return -1;
+
+	if (perf_clock_packet(f) < 0)
+		goto fail;
+	if (perf_track_packet(f, TRACK_TASKS, "barebox tasks") < 0)
+		goto fail;
+	if (perf_track_packet(f, TRACK_STAGES, "barebox stages") < 0)
+		goto fail;
+
+	for (e = head; e; e = e->next) {
+		/* At a new message, the previous stage is over: end before
+		 * begin, so equal timestamps do not make the slices nest. */
+		if (e != head &&
+		    perf_event_packet(f, e->ts_ns, TE_SLICE_END, TRACK_STAGES, NULL) < 0)
+			goto fail;
+		if (perf_event_packet(f, e->ts_ns, TE_SLICE_BEGIN, TRACK_STAGES, e->task) < 0)
+			goto fail;
+		if (perf_event_packet(f, e->ts_ns, TE_INSTANT, TRACK_TASKS, e->task) < 0)
+			goto fail;
+	}
+	/* The last stage's end is never observed; close it where it began. */
+	if (tail && perf_event_packet(f, tail->ts_ns, TE_SLICE_END, TRACK_STAGES, NULL) < 0)
+		goto fail;
+
+	if (fclose(f) != 0)
+		return -1;
+	return 0;
+
+fail:
+	saved = errno;
+	fclose(f);
 	errno = saved;
 	return -1;
 }

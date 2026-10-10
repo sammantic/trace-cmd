@@ -313,14 +313,287 @@ static void test_write_non_monotonic_clamps_delta(void)
 
 static void test_write_bad_path(void)
 {
-	trace_free();
-	CHECK(trace_add_at(1, "a") == 0);
-	errno = 0;
-	CHECK(trace_write("/nonexistent-dir-for-tracegen/x.dat") == -1);
-	CHECK(errno == ENOENT);
-	errno = 0;
-	CHECK(trace_write(NULL) == -1);
-	CHECK(errno == EINVAL);
+    trace_free();
+    CHECK(trace_add_at(1, "a") == 0);
+    errno = 0;
+    CHECK(trace_write("/nonexistent-dir-for-tracegen/x.dat") == -1);
+    CHECK(errno == ENOENT);
+    errno = 0;
+    CHECK(trace_write(NULL) == -1);
+    CHECK(errno == EINVAL);
+}
+
+/* ================================================================== */
+/* Perfetto writer tests                                              */
+/* ================================================================== */
+
+#define TEST_OUT_PF "tests/out.pftrace"
+
+/* wire types */
+#define W_VARINT 0u
+#define W_LEN    2u
+
+/* TrackEvent.Type */
+#define TE_SLICE_BEGIN 1u
+#define TE_SLICE_END   2u
+#define TE_INSTANT     3u
+
+/* One decoded protobuf field. */
+struct pfield {
+    unsigned num;
+    unsigned wire;
+    uint64_t v;         /* wire == W_VARINT */
+    const uint8_t *p;   /* wire == W_LEN */
+    size_t n;
+};
+
+/* Read a base-128 varint; advance *pp past it. */
+static int rd_varint(const uint8_t **pp, const uint8_t *end, uint64_t *out)
+{
+    const uint8_t *p = *pp;
+    uint64_t v = 0;
+    unsigned shift = 0;
+
+    while (p < end && shift <= 63) {
+        v |= (uint64_t)(*p & 0x7f) << shift;
+        if (!(*p & 0x80)) {
+            *pp = p + 1;
+            *out = v;
+            return 0;
+        }
+        p++;
+        shift += 7;
+    }
+    return -1;
+}
+
+/* Parse the next field in [p, end). Only varints and length-delimited
+ * fields exist in what the writer emits. Returns 1 at the clean end of
+ * the message, -1 on malformed input. */
+static int pbf_next(const uint8_t **pp, const uint8_t *end, struct pfield *f)
+{
+    const uint8_t *p = *pp;
+    uint64_t key;
+
+    if (p == end)
+        return 1;
+    if (rd_varint(&p, end, &key) < 0)
+        return -1;
+    f->num = (unsigned)(key >> 3);
+    f->wire = (unsigned)(key & 7);
+    if (f->wire == W_VARINT) {
+        if (rd_varint(&p, end, &f->v) < 0)
+            return -1;
+    } else if (f->wire == W_LEN) {
+        uint64_t n;
+
+        if (rd_varint(&p, end, &n) < 0 || (uint64_t)(end - p) < n)
+            return -1;
+        f->p = p;
+        f->n = (size_t)n;
+        p += n;
+    } else {
+        return -1;
+    }
+    *pp = p;
+    return 0;
+}
+
+/* The parts of one framed TracePacket the tests care about. */
+struct pfpacket {
+    int has_clock_snapshot;
+    int has_track_event;
+    int has_track_descriptor;
+    int has_ts;
+    uint64_t ts;            /* field 8 */
+    uint64_t seq_id;        /* field 10 */
+    uint64_t clock_id;      /* field 58 */
+    uint64_t seq_flags;     /* field 13 */
+    uint64_t td_uuid;       /* TrackDescriptor.uuid */
+    char td_name[64];       /* TrackDescriptor.name */
+    uint64_t te_type;       /* TrackEvent.type */
+    uint64_t te_track;      /* TrackEvent.track_uuid */
+    char te_name[256];      /* TrackEvent.name */
+    int te_has_name;
+};
+
+/* Copy a length-delimited field into a char[] of size sz. */
+static void copy_str(char *dst, size_t sz, const struct pfield *f)
+{
+    CHECK(f->n < sz);
+    memcpy(dst, f->p, f->n);
+    dst[f->n] = '\0';
+}
+
+/*
+ * Decode the next framed packet in the Trace stream at *pp.
+ * Returns 0 and fills *o; 1 at end of buffer; -1 on malformed input.
+ */
+static int pf_next(const uint8_t **pp, const uint8_t *end, struct pfpacket *o)
+{
+    const uint8_t *p = *pp, *sub_end, *q;
+    struct pfield f, sf;
+    int r;
+
+    memset(o, 0, sizeof *o);
+    if (p == end)
+        return 1;
+    if (pbf_next(&p, end, &f) < 0 || f.num != 1 || f.wire != W_LEN)
+        return -1;                      /* every packet is field 1, LEN */
+    sub_end = f.p + f.n;
+    p = f.p;                            /* iterate the packet's own fields */
+    while ((r = pbf_next(&p, sub_end, &f)) == 0) {
+        switch (f.num) {
+        case 8:
+            o->has_ts = 1;
+            o->ts = f.v;
+            break;
+        case 10:
+            o->seq_id = f.v;
+            break;
+        case 13:
+            o->seq_flags = f.v;
+            break;
+        case 58:
+            o->clock_id = f.v;
+            break;
+        case 6:
+            o->has_clock_snapshot = 1;
+            break;
+        case 11:                        /* track_event */
+            o->has_track_event = 1;
+            q = f.p;
+            while ((r = pbf_next(&q, sub_end, &sf)) == 0) {
+                if (sf.num == 9 && sf.wire == W_VARINT)
+                    o->te_type = sf.v;
+                else if (sf.num == 11 && sf.wire == W_VARINT)
+                    o->te_track = sf.v;
+                else if (sf.num == 23 && sf.wire == W_LEN) {
+                    copy_str(o->te_name, sizeof o->te_name, &sf);
+                    o->te_has_name = 1;
+                }
+            }
+            if (r < 0)
+                return -1;
+            break;
+        case 60:                        /* track_descriptor */
+            o->has_track_descriptor = 1;
+            q = f.p;
+            while ((r = pbf_next(&q, sub_end, &sf)) == 0) {
+                if (sf.num == 1 && sf.wire == W_VARINT)
+                    o->td_uuid = sf.v;
+                else if (sf.num == 2 && sf.wire == W_LEN)
+                    copy_str(o->td_name, sizeof o->td_name, &sf);
+            }
+            if (r < 0)
+                return -1;
+            break;
+        default:
+            break;
+        }
+    }
+    if (r < 0)
+        return -1;
+    *pp = sub_end;
+    return 0;
+}
+
+/* Assert that pk is a TrackEvent with the expected contents. */
+static void check_ev(const struct pfpacket *pk, uint64_t ts, unsigned type,
+                     uint64_t track, const char *name)
+{
+    CHECK(pk->has_track_event);
+    CHECK(pk->has_ts);
+    CHECK(pk->ts == ts);
+    CHECK(pk->seq_id == 1u);               /* trusted_packet_sequence_id */
+    CHECK(pk->clock_id == 3u);          /* BuiltinClock MONOTONIC */
+    CHECK(pk->te_type == type);
+    CHECK(pk->te_track == track);
+    if (name) {
+        CHECK(pk->te_has_name);
+        CHECK(strcmp(pk->te_name, name) == 0);
+    } else {
+        CHECK(!pk->te_has_name);
+    }
+}
+
+static void test_perfetto_empty_list(void)
+{
+    uint8_t *buf;
+    size_t len;
+    const uint8_t *p;
+    struct pfpacket pk;
+
+    trace_free();
+    CHECK(trace_write_perfetto(TEST_OUT_PF) == 0);
+    buf = read_file(TEST_OUT_PF, &len);
+    p = buf;
+
+    CHECK(pf_next(&p, buf + len, &pk) == 0);    /* clock snapshot */
+    CHECK(pk.has_clock_snapshot);
+    CHECK(pk.seq_flags == 1u);                  /* incremental state cleared */
+    CHECK(pk.seq_id == 1u);                     /* one writer sequence */
+    CHECK(pf_next(&p, buf + len, &pk) == 0);    /* track 1: tasks */
+    CHECK(pk.has_track_descriptor);
+    CHECK(pk.td_uuid == 1u);
+    CHECK(strcmp(pk.td_name, "barebox tasks") == 0);
+    CHECK(pf_next(&p, buf + len, &pk) == 0);    /* track 2: stages */
+    CHECK(pk.td_uuid == 2u);
+    CHECK(strcmp(pk.td_name, "barebox stages") == 0);
+    CHECK(pf_next(&p, buf + len, &pk) == 1);    /* exactly three packets */
+    free(buf);
+}
+
+static void test_perfetto_two_events(void)
+{
+    uint8_t *buf;
+    size_t len;
+    const uint8_t *p;
+    struct pfpacket pk;
+
+    trace_free();
+    CHECK(trace_add_at(1000000000ull, "barebox started") == 0);
+    CHECK(trace_add_at(1000005000ull, "kernel loaded") == 0);
+    CHECK(trace_write_perfetto(TEST_OUT_PF) == 0);
+    buf = read_file(TEST_OUT_PF, &len);
+    p = buf;
+
+    /* skip the three header packets (clock snapshot + two descriptors) */
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+
+    /* stage 1 opens its slice and marks the instant */
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000000000ull, TE_SLICE_BEGIN, 2u, "barebox started");
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000000000ull, TE_INSTANT, 1u, "barebox started");
+
+    /* stage 2: previous slice ends (before the new one begins), then
+     * begin + instant, then the final slice end at the same timestamp */
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000005000ull, TE_SLICE_END, 2u, NULL);
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000005000ull, TE_SLICE_BEGIN, 2u, "kernel loaded");
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000005000ull, TE_INSTANT, 1u, "kernel loaded");
+    CHECK(pf_next(&p, buf + len, &pk) == 0);
+    check_ev(&pk, 1000005000ull, TE_SLICE_END, 2u, NULL);
+
+    CHECK(pf_next(&p, buf + len, &pk) == 1);    /* no further packets */
+    free(buf);
+}
+
+static void test_perfetto_bad_path(void)
+{
+    trace_free();
+    CHECK(trace_add_at(1, "a") == 0);
+    errno = 0;
+    CHECK(trace_write_perfetto("/nonexistent-dir-for-tracegen/x.pftrace") == -1);
+    CHECK(errno == ENOENT);
+    errno = 0;
+    CHECK(trace_write_perfetto(NULL) == -1);
+    CHECK(errno == EINVAL);
 }
 
 int main(void)
@@ -336,6 +609,9 @@ int main(void)
     test_write_too_long_is_emsgsize();
     test_write_non_monotonic_clamps_delta();
     test_write_bad_path();
+    test_perfetto_empty_list();
+    test_perfetto_two_events();
+    test_perfetto_bad_path();
     printf("all tests passed\n");
     return 0;
 }

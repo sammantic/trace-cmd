@@ -3,9 +3,11 @@
  *
  * Records a fixed list of barebox-style boot stages, sleeping a few
  * milliseconds between them so the resulting timeline looks realistic,
- * then writes everything to trace.dat (or the path given with -o).
+ * then writes everything to trace.dat (or the path given with -o), in the
+ * format given with -f (trace-cmd "dat" or "perfetto").
  *
  * Try:  make && ./tracegen && trace-cmd report trace.dat
+ *       ./tracegen -f perfetto -o trace.pftrace   # open in ui.perfetto.dev
  */
 #define _POSIX_C_SOURCE 200809L	/* for nanosleep() and getopt() */
 #include <errno.h>
@@ -48,24 +50,40 @@ static void sleep_ms(unsigned ms)
 
 int main(int argc, char **argv)
 {
-	const char *path = "trace.dat";
+	const char *path = NULL;
+	const char *format = "dat";
+	int use_perfetto = 0;
 	size_t i;
 	int opt;
 
-	/* Only one option: -o <file>. -h prints usage. */
-	while ((opt = getopt(argc, argv, "o:h")) != -1) {
+	/* Options: -f <dat|perfetto>, -o <file>, -h prints usage. */
+	while ((opt = getopt(argc, argv, "f:o:h")) != -1) {
 		switch (opt) {
+		case 'f':
+			format = optarg;
+			break;
 		case 'o':
 			path = optarg;
 			break;
 		case 'h':
-			printf("usage: %s [-o trace.dat]\n", argv[0]);
+			printf("usage: %s [-f dat|perfetto] [-o trace.dat]\n", argv[0]);
 			return 0;
 		default:
-			fprintf(stderr, "usage: %s [-o trace.dat]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-f dat|perfetto] [-o trace.dat]\n", argv[0]);
 			return 1;
 		}
 	}
+	if (!strcmp(format, "dat")) {
+		;
+	} else if (!strcmp(format, "perfetto")) {
+		use_perfetto = 1;
+	} else {
+		fprintf(stderr, "%s: unknown format '%s' (use dat or perfetto)\n",
+			argv[0], format);
+		return 1;
+	}
+	if (!path)
+		path = use_perfetto ? "trace.pftrace" : "trace.dat";
 
 	/* "Boot": wait, then record each stage in order. */
 	for (i = 0; i < sizeof stages / sizeof stages[0]; i++) {
@@ -78,7 +96,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Everything is in memory now; write it out in one go. */
-	if (trace_write(path) < 0) {
+	if (use_perfetto ? trace_write_perfetto(path) < 0 : trace_write(path) < 0) {
 		fprintf(stderr, "tracegen: %s: %s\n", path, strerror(errno));
 		trace_free();
 		return 1;
